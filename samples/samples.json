@@ -1,0 +1,29 @@
+{
+  "GET /users": {
+    "query_params": { "page": 1, "limit": 10 }
+  },
+  "POST /users": {
+    "body": {
+      "name": "John Doe",
+      "email": "john@example.com",
+      "age": 30,
+      "address": "123 Main St"
+    }
+  },
+  "GET /users/{userId}": {
+    "path_params": { "userId": "1" }
+  },
+  "PUT /users/{userId}": {
+    "path_params": { "userId": "1" },
+    "body": {
+      "name": "John Updated",
+      "email": "john.updated@example.com"
+    }
+  },
+  "DELETE /users/{userId}": {
+    "path_params": { "userId": "1" }
+  },
+  "GET /users/{userId}/orders": {
+    "path_params": { "userId": "1" }
+  }
+}
