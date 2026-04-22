@@ -935,260 +935,182 @@ with tab_merge:
         "schema and status-code coverage."
     )
 
-    if len(specs) < 2:
-        st.warning("Load at least two specs (e.g. v1 and v2) to use this tab.")
-        st.stop()
-
-    st.markdown("### 1️⃣  Choose source version (the 'old' version with many endpoints)")
-    src_ver = st.selectbox("Source version", sorted(specs.keys()), key="mc_src")
-
-    st.markdown("### 2️⃣  Choose target version (the 'new' version with the merged endpoint)")
-    tgt_ver = st.selectbox(
-        "Target version",
-        [v for v in sorted(specs.keys()) if v != src_ver],
-        key="mc_tgt",
-    )
+    # ── Version selectors ──
+    _ver_list = sorted(specs.keys())
+    mc_col1, mc_col2 = st.columns(2)
+    with mc_col1:
+        st.markdown("**1️⃣ Source version** (old — many endpoints)")
+        src_ver = st.selectbox("Source version", _ver_list, key="mc_src", label_visibility="collapsed")
+    with mc_col2:
+        _tgt_options = [v for v in _ver_list if v != src_ver]
+        st.markdown("**2️⃣ Target version** (new — merged endpoint)")
+        tgt_ver = st.selectbox("Target version", _tgt_options if _tgt_options else _ver_list,
+                               key="mc_tgt", label_visibility="collapsed")
 
     src_endpoints = extract_endpoints(specs[src_ver])
     tgt_endpoints = extract_endpoints(specs[tgt_ver])
 
-    st.markdown("### 3️⃣  Select the v1 endpoints that were merged")
-    st.caption("Hold Ctrl/Cmd to select multiple.")
-    selected_v1_keys = st.multiselect(
-        f"Source endpoints  ({src_ver})",
-        options=sorted(src_endpoints.keys()),
-        key="mc_v1_eps",
-    )
+    if not src_endpoints:
+        st.warning(f"No endpoints found in spec **{src_ver}**. Check your spec file.")
+    elif not tgt_endpoints:
+        st.warning(f"No endpoints found in spec **{tgt_ver}**. Check your spec file.")
+    else:
+        mc_col3, mc_col4 = st.columns(2)
+        with mc_col3:
+            st.markdown(f"**3️⃣ Source endpoints to merge** ({src_ver})")
+            selected_v1_keys = st.multiselect(
+                "Source endpoints", options=sorted(src_endpoints.keys()),
+                key="mc_v1_eps", label_visibility="collapsed",
+                placeholder="Select one or more v1 endpoints…",
+            )
+        with mc_col4:
+            st.markdown(f"**4️⃣ Target merged endpoint** ({tgt_ver})")
+            _v2_options = [""] + sorted(tgt_endpoints.keys())
+            selected_v2_key = st.selectbox(
+                "Target endpoint", options=_v2_options,
+                key="mc_v2_ep", label_visibility="collapsed",
+            )
 
-    st.markdown("### 4️⃣  Select the single merged v2 endpoint")
-    selected_v2_key = st.selectbox(
-        f"Target endpoint  ({tgt_ver})",
-        options=[""] + sorted(tgt_endpoints.keys()),
-        key="mc_v2_ep",
-    )
+        run_coverage = st.button(
+            "📊 Compute Coverage", type="primary",
+            disabled=not (selected_v1_keys and selected_v2_key),
+        )
 
-    run_coverage = st.button("📊 Compute Coverage", type="primary", disabled=not (selected_v1_keys and selected_v2_key))
-
-    if not selected_v1_keys:
-        st.info("Select at least one source (v1) endpoint above.")
-    elif not selected_v2_key:
-        st.info("Select the target (v2) merged endpoint above.")
-    elif run_coverage or st.session_state.get("mc_last_result"):
-
-        if run_coverage:
-            v1_eps_selected = {k: src_endpoints[k] for k in selected_v1_keys}
-            result = compute_merge_coverage(v1_eps_selected, tgt_endpoints[selected_v2_key], selected_v2_key)
-            per_ep = per_endpoint_coverage(v1_eps_selected, tgt_endpoints[selected_v2_key])
-            st.session_state["mc_last_result"] = result
-            st.session_state["mc_per_ep"]     = per_ep
-            st.session_state["mc_v1_keys"]    = selected_v1_keys
-            st.session_state["mc_v2_key"]     = selected_v2_key
+        # ── Guidance messages ──
+        if not selected_v1_keys:
+            st.info("☝️ Select one or more source (v1) endpoints above.")
+        elif not selected_v2_key:
+            st.info("☝️ Select the merged target (v2) endpoint above.")
         else:
-            result = st.session_state["mc_last_result"]
-            per_ep = st.session_state["mc_per_ep"]
+            # ── Compute on button click ──
+            if run_coverage:
+                try:
+                    _v1_selected = {k: src_endpoints[k] for k in selected_v1_keys}
+                    _result = compute_merge_coverage(_v1_selected, tgt_endpoints[selected_v2_key], selected_v2_key)
+                    _per_ep = per_endpoint_coverage(_v1_selected, tgt_endpoints[selected_v2_key])
+                    st.session_state["mc_last_result"]   = _result
+                    st.session_state["mc_per_ep"]        = _per_ep
+                    st.session_state["mc_sel_v1"]        = selected_v1_keys
+                    st.session_state["mc_sel_v2"]        = selected_v2_key
+                except Exception as _exc:
+                    st.error(f"❌ Coverage computation failed: {_exc}")
+                    st.session_state.pop("mc_last_result", None)
 
-        # ── Summary banner ──
-        overall = result["overall_pct"]
-        grade   = coverage_color(overall)
-        color   = "green" if overall >= 90 else ("orange" if overall >= 60 else "red")
-        st.markdown(
-            f"""
-            <div style="border-radius:12px; padding:20px; background:#1e1e2e; margin-bottom:16px;">
-                <div style="font-size:2.5rem; font-weight:700; color:{color};">{grade} {overall}% Overall Coverage</div>
-                <div style="color:#aaa; margin-top:4px;">
-                    <b>{len(result['v1_ep_keys'])} source endpoint(s)</b> →
-                    <b>{result['v2_ep_key']}</b>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            # ── Show cached or fresh results ──
+            _cached = st.session_state.get("mc_last_result")
+            if _cached and st.session_state.get("mc_sel_v2") == selected_v2_key:
+                result = _cached
+                per_ep = st.session_state.get("mc_per_ep", [])
 
-        # ── 4 metric cards ──
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        sections = [
-            (mc1, "Parameters",      result["parameters"]),
-            (mc2, "Request Schema",  result["request_schema"]),
-            (mc3, "Response Schema", result["response_schema"]),
-            (mc4, "Status Codes",    result["response_codes"]),
-        ]
-        for col, label, sec in sections:
-            pct   = sec["pct"]
-            emoji = coverage_color(pct)
-            col.metric(
-                label=f"{emoji} {label}",
-                value=f"{pct}%",
-                delta=f"{sec['covered']}/{sec['total']} covered",
-            )
+                overall = result["overall_pct"]
+                grade   = coverage_color(overall)
+                color   = "green" if overall >= 90 else ("orange" if overall >= 60 else "red")
+                st.markdown(
+                    f'<div style="border-radius:12px;padding:20px;background:#1e1e2e;margin:12px 0">'
+                    f'<div style="font-size:2.2rem;font-weight:700;color:{color}">{grade} {overall}% Overall Coverage</div>'
+                    f'<div style="color:#aaa;margin-top:4px">'
+                    f'<b>{len(result["v1_ep_keys"])} source endpoint(s)</b> → <b>{result["v2_ep_key"]}</b>'
+                    f'</div></div>',
+                    unsafe_allow_html=True,
+                )
 
-        # ── Progress bars ──
-        st.markdown("---")
-        st.subheader("Coverage Breakdown")
-        bar_cols = st.columns(4)
-        for (col, label, sec) in sections:
-            with col:
-                st.caption(label)
-                st.progress(int(sec["pct"]), text=f"{sec['pct']}%")
-
-        # ── Per-endpoint individual breakdown ──
-        st.divider()
-        st.subheader("Per-Source-Endpoint Breakdown")
-        st.caption(
-            "How well does the merged v2 endpoint cover each individual v1 endpoint?"
-        )
-        if per_ep:
-            per_ep_df = pd.DataFrame(per_ep).set_index("v1_endpoint")
-            st.dataframe(per_ep_df, use_container_width=True)
-
-            # Heat-map style: colour the Overall % column
-            st.markdown("**Grade legend:** 🟢 ≥90% &nbsp; 🟡 60-89% &nbsp; 🔴 <60%")
-
-        # ── Detail tables ──
-        st.divider()
-        st.subheader("Detailed Gap Analysis")
-
-        detail_tab_params, detail_tab_req, detail_tab_resp, detail_tab_codes = st.tabs([
-            "🔧 Parameters", "📤 Request Schema", "📥 Response Schema", "🔢 Status Codes"
-        ])
-
-        with detail_tab_params:
-            rows = result["parameters"]["rows"]
-            if not rows:
-                st.info("No parameters found in selected v1 endpoints.")
-            else:
-                missing = [r for r in rows if not r["in_v2"]]
-                covered = [r for r in rows if r["in_v2"]]
-                if missing:
-                    st.error(f"❌ {len(missing)} parameter(s) missing in v2:")
-                    st.dataframe(
-                        pd.DataFrame([{
-                            "Parameter":   r["parameter"],
-                            "In":          r["in"],
-                            "Required v1": "✅" if r["required_v1"] else "",
-                            "Source endpoints": ", ".join(r["sources"]),
-                        } for r in missing]),
-                        use_container_width=True, hide_index=True,
-                    )
-                if covered:
-                    with st.expander(f"✅ {len(covered)} parameter(s) covered"):
-                        st.dataframe(
-                            pd.DataFrame([{
-                                "Parameter":   r["parameter"],
-                                "In":          r["in"],
-                                "Required v1": "✅" if r["required_v1"] else "",
-                                "Required v2": "✅" if r["v2_required"] else "",
-                            } for r in covered]),
-                            use_container_width=True, hide_index=True,
-                        )
-
-        with detail_tab_req:
-            rows = result["request_schema"]["rows"]
-            if not rows:
-                st.info("No request body schema fields found in selected v1 endpoints.")
-            else:
-                missing = [r for r in rows if not r["in_v2"]]
-                covered = [r for r in rows if r["in_v2"]]
-                type_mismatch = [
-                    r for r in covered
-                    if r["type_v1"] and r["type_v2"] and r["type_v1"] != r["type_v2"]
+                # ── 4 metric cards ──
+                _sections = [
+                    ("Parameters",     result["parameters"]),
+                    ("Request Schema", result["request_schema"]),
+                    ("Resp Schema",    result["response_schema"]),
+                    ("Status Codes",   result["response_codes"]),
                 ]
-                if missing:
-                    st.error(f"❌ {len(missing)} request field(s) missing in v2:")
-                    st.dataframe(
-                        pd.DataFrame([{"Field": r["field"], "Type v1": r["type_v1"],
-                                       "Required v1": "✅" if r["required_v1"] else ""}
-                                      for r in missing]),
-                        use_container_width=True, hide_index=True,
+                _cols = st.columns(4)
+                for (_col, (_lbl, _sec)) in zip(_cols, _sections):
+                    _col.metric(
+                        label=f"{coverage_color(_sec['pct'])} {_lbl}",
+                        value=f"{_sec['pct']}%",
+                        delta=f"{_sec['covered']}/{_sec['total']} covered",
                     )
-                if type_mismatch:
-                    st.warning(f"⚠️ {len(type_mismatch)} field(s) covered but with TYPE CHANGE:")
-                    st.dataframe(
-                        pd.DataFrame([{"Field": r["field"],
-                                       "Type v1": r["type_v1"], "Type v2": r["type_v2"]}
-                                      for r in type_mismatch]),
-                        use_container_width=True, hide_index=True,
-                    )
-                if covered:
-                    with st.expander(f"✅ {len(covered)} field(s) covered"):
-                        st.dataframe(
-                            pd.DataFrame([{"Field": r["field"],
-                                           "Type v1": r["type_v1"], "Type v2": r["type_v2"]}
-                                          for r in covered]),
-                            use_container_width=True, hide_index=True,
-                        )
 
-        with detail_tab_resp:
-            rows = result["response_schema"]["rows"]
-            if not rows:
-                st.info("No response body schema fields found in selected v1 endpoints.")
+                # ── Progress bars ──
+                st.markdown("---")
+                st.subheader("Coverage Breakdown")
+                _pcols = st.columns(4)
+                for (_pc, (_lbl, _sec)) in zip(_pcols, _sections):
+                    with _pc:
+                        st.caption(_lbl)
+                        st.progress(int(_sec["pct"]), text=f"{_sec['pct']}%")
+
+                # ── Per-endpoint breakdown ──
+                if per_ep:
+                    st.divider()
+                    st.subheader("Per-Source-Endpoint Breakdown")
+                    st.caption("How well does the v2 endpoint cover each individual v1 endpoint?")
+                    st.dataframe(pd.DataFrame(per_ep).set_index("v1_endpoint"), use_container_width=True)
+                    st.markdown("**Grade:** 🟢 ≥90%  🟡 60–89%  🔴 <60%")
+
+                # ── Detail gap analysis ──
+                st.divider()
+                st.subheader("Detailed Gap Analysis")
+                _dt_params, _dt_req, _dt_resp, _dt_codes = st.tabs([
+                    "🔧 Parameters", "📤 Request Schema", "📥 Response Schema", "🔢 Status Codes"
+                ])
+
+                def _show_gap_table(tab, rows, key_col, extra_cols=None):
+                    with tab:
+                        if not rows:
+                            st.info("No data found for selected endpoints.")
+                            return
+                        _missing = [r for r in rows if not r["in_v2"]]
+                        _covered = [r for r in rows if r["in_v2"]]
+                        _mismatch = [r for r in _covered
+                                     if r.get("type_v1") and r.get("type_v2") and r["type_v1"] != r["type_v2"]]
+                        if _missing:
+                            st.error(f"❌ {len(_missing)} missing in v2")
+                            st.dataframe(pd.DataFrame(_missing)[[key_col] + (extra_cols or [])],
+                                         use_container_width=True, hide_index=True)
+                        if _mismatch:
+                            st.warning(f"⚠️ {len(_mismatch)} type-changed")
+                            st.dataframe(pd.DataFrame(_mismatch)[[key_col, "type_v1", "type_v2"]],
+                                         use_container_width=True, hide_index=True)
+                        with st.expander(f"✅ {len(_covered)} covered"):
+                            st.dataframe(pd.DataFrame(_covered)[[key_col] + (extra_cols or [])],
+                                         use_container_width=True, hide_index=True)
+
+                _show_gap_table(_dt_params, result["parameters"]["rows"],    "parameter", ["in", "required_v1"])
+                _show_gap_table(_dt_req,    result["request_schema"]["rows"], "field",     ["type_v1", "required_v1"])
+                _show_gap_table(_dt_resp,   result["response_schema"]["rows"],"field",     ["type_v1"])
+
+                with _dt_codes:
+                    st.dataframe(pd.DataFrame([{
+                        "Code": r["code"], "In v1": "✅" if r["in_v1"] else "",
+                        "In v2": "✅" if r["in_v2"] else "", "Status": r["status"],
+                    } for r in result["response_codes"]["rows"]]),
+                        use_container_width=True, hide_index=True)
+
+                # ── Export ──
+                st.divider()
+                import io as _io
+                _buf = _io.BytesIO()
+                with pd.ExcelWriter(_buf, engine="openpyxl") as _w:
+                    for _sname, _srows in [
+                        ("Parameters",     result["parameters"]["rows"]),
+                        ("Request Schema", result["request_schema"]["rows"]),
+                        ("Response Schema",result["response_schema"]["rows"]),
+                        ("Status Codes",   result["response_codes"]["rows"]),
+                    ]:
+                        if _srows:
+                            pd.DataFrame(_srows).to_excel(_w, sheet_name=_sname[:31], index=False)
+                    if per_ep:
+                        pd.DataFrame(per_ep).to_excel(_w, sheet_name="Per Endpoint", index=False)
+                _buf.seek(0)
+                st.download_button(
+                    "⬇️ Download Coverage Report (Excel)", data=_buf,
+                    file_name="merge_coverage_report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
             else:
-                missing = [r for r in rows if not r["in_v2"]]
-                covered = [r for r in rows if r["in_v2"]]
-                type_mismatch = [
-                    r for r in covered
-                    if r["type_v1"] and r["type_v2"] and r["type_v1"] != r["type_v2"]
-                ]
-                if missing:
-                    st.error(f"❌ {len(missing)} response field(s) missing in v2:")
-                    st.dataframe(
-                        pd.DataFrame([{"Field": r["field"], "Type v1": r["type_v1"]}
-                                      for r in missing]),
-                        use_container_width=True, hide_index=True,
-                    )
-                if type_mismatch:
-                    st.warning(f"⚠️ {len(type_mismatch)} field(s) covered but TYPE CHANGED:")
-                    st.dataframe(
-                        pd.DataFrame([{"Field": r["field"],
-                                       "Type v1": r["type_v1"], "Type v2": r["type_v2"]}
-                                      for r in type_mismatch]),
-                        use_container_width=True, hide_index=True,
-                    )
-                if covered:
-                    with st.expander(f"✅ {len(covered)} field(s) covered"):
-                        st.dataframe(
-                            pd.DataFrame([{"Field": r["field"],
-                                           "Type v1": r["type_v1"], "Type v2": r["type_v2"]}
-                                          for r in covered]),
-                            use_container_width=True, hide_index=True,
-                        )
-
-        with detail_tab_codes:
-            rows = result["response_codes"]["rows"]
-            st.dataframe(
-                pd.DataFrame([{
-                    "Status Code": r["code"],
-                    "In v1": "✅" if r["in_v1"] else "",
-                    "In v2": "✅" if r["in_v2"] else "",
-                    "Status": r["status"],
-                } for r in rows]),
-                use_container_width=True, hide_index=True,
-            )
-
-        # ── Export ──
-        st.divider()
-        import io as _io
-        export_sections = {
-            "Parameters":      result["parameters"]["rows"],
-            "Request Schema":  result["request_schema"]["rows"],
-            "Response Schema": result["response_schema"]["rows"],
-            "Status Codes":    result["response_codes"]["rows"],
-        }
-        buf2 = _io.BytesIO()
-        with pd.ExcelWriter(buf2, engine="openpyxl") as writer:
-            for sheet, rows in export_sections.items():
-                if rows:
-                    pd.DataFrame(rows).to_excel(writer, sheet_name=sheet[:31], index=False)
-            if per_ep:
-                pd.DataFrame(per_ep).to_excel(writer, sheet_name="Per Endpoint", index=False)
-        buf2.seek(0)
-        st.download_button(
-            label="⬇️ Download Coverage Report (Excel)",
-            data=buf2,
-            file_name="merge_coverage_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+                st.info("☝️ Click **Compute Coverage** to run the analysis.")
 
 
 # ─── Footer ───
 st.divider()
 st.caption("Swagger API Diff Tool | Compare API versions, validate samples, test live endpoints")
+
