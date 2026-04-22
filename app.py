@@ -708,221 +708,207 @@ with tab_excel_curl:
 - `OWNER` column must contain `token:` followed by the curl that fetches the real token.
 - The token curl's response should be JSON with `access_token`, `token`, or `id_token` field, or a plain JWT string.
             """)
-        st.stop()
+    else:
+        # ── Parse Excel ──
+        df_raw = None
+        try:
+            df_raw = load_excel(uploaded_excel)
+        except ValueError as e:
+            st.error(f"❌ {e}")
+        except Exception as e:
+            st.error(f"❌ Failed to read file: {e}")
 
-    # ── Parse Excel ──
-    try:
-        df_raw = load_excel(uploaded_excel)
-    except ValueError as e:
-        st.error(f"❌ {e}")
-        st.stop()
-    except Exception as e:
-        st.error(f"❌ Failed to read file: {e}")
-        st.stop()
+        if df_raw is not None:
+            st.success(f"✅ Loaded **{len(df_raw)} row(s)** from file")
 
-    st.success(f"✅ Loaded **{len(df_raw)} row(s)** from file")
+            # ── Preview table ──
+            with st.expander("🔍 Preview raw data", expanded=False):
+                preview_df = df_raw[["api_name", "owner_name"]].copy()
+                preview_df["has_token_curl"] = df_raw["token_curl"].notna().map({True: "✅", False: "❌"})
+                preview_df["curls_snippet"] = df_raw["curls"].str[:120] + "…"
+                st.dataframe(preview_df.rename(columns={
+                    "api_name": "API Name",
+                    "owner_name": "Owner",
+                    "has_token_curl": "Token Curl Found",
+                    "curls_snippet": "CURLs (preview)",
+                }), use_container_width=True, hide_index=True)
 
-    # ── Preview table ──
-    with st.expander("🔍 Preview raw data", expanded=False):
-        preview_df = df_raw[["api_name", "owner_name"]].copy()
-        preview_df["has_token_curl"] = df_raw["token_curl"].notna().map({True: "✅", False: "❌"})
-        preview_df["curls_snippet"] = df_raw["curls"].str[:120] + "…"
-        st.dataframe(preview_df.rename(columns={
-            "api_name": "API Name",
-            "owner_name": "Owner",
-            "has_token_curl": "Token Curl Found",
-            "curls_snippet": "CURLs (preview)",
-        }), use_container_width=True, hide_index=True)
+            # ── Per-owner token fetching ──
+            st.subheader("Step 1 — Fetch Tokens")
+            st.markdown(
+                "Each unique owner's `token:` curl will be executed once. "
+                "The resulting token is then injected into all API curls for that owner."
+            )
 
-    # ── Per-owner token fetching ──
-    st.subheader("Step 1 — Fetch Tokens")
-    st.markdown(
-        "Each unique owner's `token:` curl will be executed once. "
-        "The resulting token is then injected into all API curls for that owner."
-    )
+            # Group by unique token curl
+            unique_token_curls = df_raw[["owner_name", "token_curl"]].dropna(subset=["token_curl"]).drop_duplicates("token_curl")
+            no_token_rows = df_raw[df_raw["token_curl"].isna()]
 
-    # Group by unique token curl
-    unique_token_curls = df_raw[["owner_name", "token_curl"]].dropna(subset=["token_curl"]).drop_duplicates("token_curl")
-    no_token_rows = df_raw[df_raw["token_curl"].isna()]
+            if not no_token_rows.empty:
+                st.warning(
+                    f"⚠️ {len(no_token_rows)} row(s) have no `token:` curl in OWNER — "
+                    "their bearer token will NOT be replaced: " +
+                    ", ".join(no_token_rows["api_name"].tolist())
+                )
 
-    if not no_token_rows.empty:
-        st.warning(
-            f"⚠️ {len(no_token_rows)} row(s) have no `token:` curl in OWNER — "
-            "their bearer token will NOT be replaced: " +
-            ", ".join(no_token_rows["api_name"].tolist())
-        )
+            timeout_secs = st.slider("Request timeout (seconds)", min_value=5, max_value=120, value=30, step=5)
 
-    timeout_secs = st.slider("Request timeout (seconds)", min_value=5, max_value=120, value=30, step=5)
+            col_fetch, col_run = st.columns([1, 1])
+            do_fetch_tokens = col_fetch.button("🔑 Fetch All Tokens", type="primary")
+            do_run_all     = col_run.button("🚀 Fetch Tokens + Run All APIs")
 
-    col_fetch, col_run = st.columns([1, 1])
-    do_fetch_tokens = col_fetch.button("🔑 Fetch All Tokens", type="primary")
-    do_run_all     = col_run.button("🚀 Fetch Tokens + Run All APIs")
+            # ── Session state init ──
+            if "ec_tokens" not in st.session_state:
+                st.session_state["ec_tokens"]       = {}
+            if "ec_patched_rows" not in st.session_state:
+                st.session_state["ec_patched_rows"] = []
+            if "ec_results" not in st.session_state:
+                st.session_state["ec_results"]      = []
 
-    # ── Session state init ──
-    if "ec_tokens" not in st.session_state:
-        st.session_state["ec_tokens"]       = {}   # owner_name → token_result dict
-    if "ec_patched_rows" not in st.session_state:
-        st.session_state["ec_patched_rows"] = []   # list of dicts
-    if "ec_results" not in st.session_state:
-        st.session_state["ec_results"]      = []   # list of dicts
+            def _fetch_all_tokens(timeout):
+                tokens = {}
+                prog = st.progress(0, text="Fetching tokens…")
+                for i, (_, row) in enumerate(unique_token_curls.iterrows()):
+                    owner  = row["owner_name"]
+                    tcurl  = row["token_curl"]
+                    prog.progress((i + 1) / max(len(unique_token_curls), 1), text=f"Fetching token for {owner}…")
+                    result = fetch_token_from_curl(tcurl, timeout=timeout)
+                    tokens[owner] = result
+                prog.empty()
+                st.session_state["ec_tokens"] = tokens
+                return tokens
 
-    def _fetch_all_tokens(timeout):
-        """Fetch tokens for all unique owners and store in session state."""
-        tokens = {}
-        prog = st.progress(0, text="Fetching tokens…")
-        for i, (_, row) in enumerate(unique_token_curls.iterrows()):
-            owner  = row["owner_name"]
-            tcurl  = row["token_curl"]
-            prog.progress((i + 1) / max(len(unique_token_curls), 1), text=f"Fetching token for {owner}…")
-            result = fetch_token_from_curl(tcurl, timeout=timeout)
-            tokens[owner] = result
-        prog.empty()
-        st.session_state["ec_tokens"] = tokens
-        return tokens
+            def _build_patched_rows(tokens):
+                patched = []
+                for _, row in df_raw.iterrows():
+                    owner    = row["owner_name"]
+                    curl_cmd = row["curls"]
+                    token_result = tokens.get(owner, {})
+                    real_token = token_result.get("token") if token_result else None
+                    patched_curl = patch_bearer_token(curl_cmd, real_token) if real_token else curl_cmd
+                    patched.append({
+                        "api_name":      row["api_name"],
+                        "owner":         owner,
+                        "original_curl": curl_cmd,
+                        "patched_curl":  patched_curl,
+                        "token":         real_token,
+                        "token_error":   token_result.get("error") if token_result else "No token curl found",
+                        "token_patched": real_token is not None,
+                    })
+                st.session_state["ec_patched_rows"] = patched
+                return patched
 
-    def _build_patched_rows(tokens):
-        """Patch bearer tokens in CURLs and build row list."""
-        patched = []
-        for _, row in df_raw.iterrows():
-            owner   = row["owner_name"]
-            curl_cmd = row["curls"]
-            token_result = tokens.get(owner, {})
-            real_token = token_result.get("token") if token_result else None
+            def _run_all_apis(patched_rows, timeout):
+                results = []
+                prog = st.progress(0, text="Running API calls…")
+                for i, row in enumerate(patched_rows):
+                    prog.progress((i + 1) / max(len(patched_rows), 1), text=f"Calling {row['api_name']}…")
+                    if not row["token_patched"]:
+                        results.append({**row, "status_code": None, "elapsed_ms": None,
+                                        "body": None, "run_error": row["token_error"]})
+                        continue
+                    resp = execute_api_curl(row["patched_curl"], timeout=timeout)
+                    results.append({**row,
+                                    "status_code": resp["status_code"],
+                                    "elapsed_ms":  resp["elapsed_ms"],
+                                    "body":        resp["body"],
+                                    "run_error":   resp["error"]})
+                prog.empty()
+                st.session_state["ec_results"] = results
+                return results
 
-            patched_curl = patch_bearer_token(curl_cmd, real_token) if real_token else curl_cmd
-            patched.append({
-                "api_name":    row["api_name"],
-                "owner":       owner,
-                "original_curl": curl_cmd,
-                "patched_curl": patched_curl,
-                "token":       real_token,
-                "token_error": token_result.get("error") if token_result else "No token curl found",
-                "token_patched": real_token is not None,
-            })
-        st.session_state["ec_patched_rows"] = patched
-        return patched
+            # ── Execute on button press ──
+            if do_fetch_tokens or do_run_all:
+                with st.spinner("Fetching tokens…"):
+                    tokens = _fetch_all_tokens(timeout_secs)
+                patched = _build_patched_rows(tokens)
+                if do_run_all:
+                    with st.spinner("Running API calls…"):
+                        _run_all_apis(patched, timeout_secs)
 
-    def _run_all_apis(patched_rows, timeout):
-        """Execute all patched API curls."""
-        results = []
-        prog = st.progress(0, text="Running API calls…")
-        for i, row in enumerate(patched_rows):
-            prog.progress((i + 1) / max(len(patched_rows), 1), text=f"Calling {row['api_name']}…")
-            if not row["token_patched"]:
-                results.append({**row, "status_code": None, "elapsed_ms": None,
-                                 "body": None, "run_error": row["token_error"]})
-                continue
-            resp = execute_api_curl(row["patched_curl"], timeout=timeout)
-            results.append({**row,
-                            "status_code": resp["status_code"],
-                            "elapsed_ms":  resp["elapsed_ms"],
-                            "body":        resp["body"],
-                            "run_error":   resp["error"]})
-        prog.empty()
-        st.session_state["ec_results"] = results
-        return results
+            # ── Token status ──
+            if st.session_state["ec_tokens"]:
+                st.subheader("Token Fetch Results")
+                token_rows = []
+                for owner, res in st.session_state["ec_tokens"].items():
+                    token_rows.append({
+                        "Owner":           owner,
+                        "Status":          "✅ Got Token" if res["token"] else "❌ Failed",
+                        "Token (preview)": (res["token"] or "")[:40] + "…" if res["token"] else "",
+                        "Time (ms)":       round(res["elapsed_ms"], 0),
+                        "Error":           res["error"] or "",
+                    })
+                st.dataframe(pd.DataFrame(token_rows), use_container_width=True, hide_index=True)
 
-    # ── Execute on button press ──
-    if do_fetch_tokens or do_run_all:
-        with st.spinner("Fetching tokens…"):
-            tokens = _fetch_all_tokens(timeout_secs)
-        patched = _build_patched_rows(tokens)
-        if do_run_all:
-            with st.spinner("Running API calls…"):
-                _run_all_apis(patched, timeout_secs)
+            # ── Patched CURLs preview ──
+            if st.session_state["ec_patched_rows"]:
+                st.subheader("Step 2 — Patched CURLs Preview")
+                with st.expander("View all patched curls", expanded=False):
+                    for row in st.session_state["ec_patched_rows"]:
+                        icon = "✅" if row["token_patched"] else "❌"
+                        st.markdown(f"**{icon} {row['api_name']}** (owner: {row['owner']})")
+                        if not row["token_patched"]:
+                            st.error(f"Token not available: {row['token_error']}")
+                        st.code(row["patched_curl"], language="bash")
+                        st.divider()
 
-    # ── Token status ──
-    if st.session_state["ec_tokens"]:
-        st.subheader("Token Fetch Results")
-        token_rows = []
-        for owner, res in st.session_state["ec_tokens"].items():
-            token_rows.append({
-                "Owner":      owner,
-                "Status":     "✅ Got Token" if res["token"] else "❌ Failed",
-                "Token (preview)": (res["token"] or "")[:40] + "…" if res["token"] else "",
-                "Time (ms)": round(res["elapsed_ms"], 0),
-                "Error":     res["error"] or "",
-            })
-        st.dataframe(pd.DataFrame(token_rows), use_container_width=True, hide_index=True)
+                if not do_run_all:
+                    if st.button("🚀 Run All Patched API Calls"):
+                        with st.spinner("Running API calls…"):
+                            _run_all_apis(st.session_state["ec_patched_rows"], timeout_secs)
 
-    # ── Patched CURLs preview ──
-    if st.session_state["ec_patched_rows"]:
-        st.subheader("Step 2 — Patched CURLs Preview")
-        with st.expander("View all patched curls", expanded=False):
-            for row in st.session_state["ec_patched_rows"]:
-                icon = "✅" if row["token_patched"] else "❌"
-                st.markdown(f"**{icon} {row['api_name']}** (owner: {row['owner']})")
-                if not row["token_patched"]:
-                    st.error(f"Token not available: {row['token_error']}")
-                st.code(row["patched_curl"], language="bash")
-                st.divider()
+            # ── Results table ──
+            if st.session_state["ec_results"]:
+                st.subheader("Step 3 — API Call Results")
+                summary_rows = []
+                for r in st.session_state["ec_results"]:
+                    sc = r.get("status_code")
+                    ok = isinstance(sc, int) and 200 <= sc < 300
+                    summary_rows.append({
+                        "API Name":  r["api_name"],
+                        "Owner":     r["owner"],
+                        "Status":    f"{'✅' if ok else '❌'} {sc}" if sc else f"❌ {r.get('run_error', 'N/A')}",
+                        "Time (ms)": r.get("elapsed_ms", ""),
+                        "Token OK":  "✅" if r["token_patched"] else "❌",
+                    })
+                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-        # Run button for already-fetched
-        if not do_run_all:
-            if st.button("🚀 Run All Patched API Calls"):
-                with st.spinner("Running API calls…"):
-                    _run_all_apis(st.session_state["ec_patched_rows"], timeout_secs)
+                st.subheader("Detailed Results")
+                for r in st.session_state["ec_results"]:
+                    sc = r.get("status_code")
+                    ok = isinstance(sc, int) and 200 <= sc < 300
+                    with st.expander(f"{'✅' if ok else '❌'} **{r['api_name']}** — Status: `{sc}` — {r.get('elapsed_ms', 'N/A')} ms"):
+                        if r.get("run_error"):
+                            st.error(r["run_error"])
+                        if r.get("body"):
+                            st.json(r["body"]) if isinstance(r["body"], (dict, list)) else st.code(str(r["body"]))
+                        else:
+                            st.info("(empty response body)")
+                        with st.expander("🔧 Patched CURL used", expanded=False):
+                            st.code(r["patched_curl"], language="bash")
 
-    # ── Results table ──
-    if st.session_state["ec_results"]:
-        st.subheader("Step 3 — API Call Results")
-
-        summary_rows = []
-        for r in st.session_state["ec_results"]:
-            sc = r.get("status_code")
-            ok = isinstance(sc, int) and 200 <= sc < 300
-            summary_rows.append({
-                "API Name":   r["api_name"],
-                "Owner":      r["owner"],
-                "Status":     f"{'✅' if ok else '❌'} {sc}" if sc else f"❌ {r.get('run_error', 'N/A')}",
-                "Time (ms)": r.get("elapsed_ms", ""),
-                "Token OK":   "✅" if r["token_patched"] else "❌",
-            })
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-
-        # Detailed per-row drill-down
-        st.subheader("Detailed Results")
-        for r in st.session_state["ec_results"]:
-            sc = r.get("status_code")
-            ok = isinstance(sc, int) and 200 <= sc < 300
-            icon = "✅" if ok else "❌"
-            label = f"{icon} **{r['api_name']}** — Status: `{sc}` — {r.get('elapsed_ms', 'N/A')} ms"
-            with st.expander(label):
-                if r.get("run_error"):
-                    st.error(r["run_error"])
-                if r.get("body"):
-                    if isinstance(r["body"], (dict, list)):
-                        st.json(r["body"])
-                    else:
-                        st.code(str(r["body"]))
-                else:
-                    st.info("(empty response body)")
-                with st.expander("🔧 Patched CURL used", expanded=False):
-                    st.code(r["patched_curl"], language="bash")
-
-        # ── Export results ──
-        import io
-        export_rows = []
-        for r in st.session_state["ec_results"]:
-            export_rows.append({
-                "API Name":    r["api_name"],
-                "Owner":       r["owner"],
-                "Status Code": r.get("status_code", ""),
-                "Time (ms)":   r.get("elapsed_ms", ""),
-                "Token OK":    r["token_patched"],
-                "Error":       r.get("run_error", ""),
-                "Response":    str(r.get("body", ""))[:500],
-            })
-        export_df = pd.DataFrame(export_rows)
-        buf = io.BytesIO()
-        export_df.to_excel(buf, index=False)
-        buf.seek(0)
-        st.download_button(
-            label="⬇️ Download Results as Excel",
-            data=buf,
-            file_name="curl_runner_results.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+                # ── Export ──
+                import io
+                export_rows = []
+                for r in st.session_state["ec_results"]:
+                    export_rows.append({
+                        "API Name":    r["api_name"],
+                        "Owner":       r["owner"],
+                        "Status Code": r.get("status_code", ""),
+                        "Time (ms)":   r.get("elapsed_ms", ""),
+                        "Token OK":    r["token_patched"],
+                        "Error":       r.get("run_error", ""),
+                        "Response":    str(r.get("body", ""))[:500],
+                    })
+                buf = io.BytesIO()
+                pd.DataFrame(export_rows).to_excel(buf, index=False)
+                buf.seek(0)
+                st.download_button(
+                    label="⬇️ Download Results as Excel",
+                    data=buf,
+                    file_name="curl_runner_results.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
 
 # ═══ TAB 8: Merge Coverage ═══
