@@ -7,13 +7,12 @@ Provides two high-level analyses:
   2. find_redundant_endpoints — same-version: which endpoints are suspiciously
                                similar (duplication / consolidation candidates)?
 
-Similarity is computed from four weighted signals:
-  - Path token Jaccard  (35%)
-  - Parameter overlap   (25%)
+Similarity is computed from five weighted signals:
+  - Response schema     (45%)  ← primary: same output shape = same logical resource
+  - HTTP method match   (20%)  ← primary: same verb = same operation intent
   - Request schema      (20%)
-  - Response schema     (20%)
-
-HTTP method mismatch applies a 0.5× penalty.
+  - Path tokens         (10%)
+  - Parameter overlap    (5%)
 """
 
 from __future__ import annotations
@@ -91,29 +90,30 @@ def score_pair(
     Compute similarity (0–100) between two endpoints.
 
     Returns (overall_score, breakdown_dict).
-    breakdown_dict keys: path, params, req_schema, resp_schema.
+    breakdown_dict keys: path, params, req_schema, resp_schema, method.
     """
     path_score   = _jaccard(_path_tokens(key1), _path_tokens(key2)) * 100
     param_score  = _jaccard(_param_keys(ep1),   _param_keys(ep2))   * 100
     req_score    = _jaccard(_req_field_keys(ep1), _req_field_keys(ep2)) * 100
     resp_score   = _jaccard(_resp_field_keys(ep1), _resp_field_keys(ep2)) * 100
 
+    m1, m2 = _method(key1), _method(key2)
+    method_score = 100.0 if (not m1 or not m2 or m1 == m2) else 0.0
+
     weighted = (
-        path_score  * 0.35 +
-        param_score * 0.25 +
-        req_score   * 0.20 +
-        resp_score  * 0.20
+        resp_score   * 0.45 +
+        method_score * 0.20 +
+        req_score    * 0.20 +
+        path_score   * 0.10 +
+        param_score  * 0.05
     )
 
-    # Method mismatch penalty
-    if _method(key1) and _method(key2) and _method(key1) != _method(key2):
-        weighted *= 0.5
-
     breakdown = {
-        "path":       round(path_score,  1),
-        "params":     round(param_score, 1),
-        "req_schema": round(req_score,   1),
-        "resp_schema": round(resp_score, 1),
+        "path":        round(path_score,   1),
+        "params":      round(param_score,  1),
+        "req_schema":  round(req_score,    1),
+        "resp_schema": round(resp_score,   1),
+        "method":      round(method_score, 1),
     }
     return round(weighted, 1), breakdown
 

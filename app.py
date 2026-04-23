@@ -1189,10 +1189,11 @@ with tab_smart:
                             _bd = c["breakdown"]
                             st.markdown(
                                 f"**{c['v1_key']}** — Overall: `{c['score']}%`  \n"
-                                f"Path: `{_bd['path']}%` | "
-                                f"Params: `{_bd['params']}%` | "
+                                f"Resp Schema ★: `{_bd['resp_schema']}%` | "
+                                f"Method ★: `{_bd['method']}%` | "
                                 f"Req Schema: `{_bd['req_schema']}%` | "
-                                f"Resp Schema: `{_bd['resp_schema']}%`"
+                                f"Path: `{_bd['path']}%` | "
+                                f"Params: `{_bd['params']}%`"
                             )
                             st.progress(int(c["score"]))
                             st.divider()
@@ -1229,7 +1230,6 @@ with tab_smart:
             with st.spinner(f"Scoring {_n_eps * (_n_eps - 1) // 2} endpoint pairs…"):
                 _sr_pairs = find_redundant_endpoints(_sr_eps, threshold=_sr_threshold)
             st.session_state["sr_pairs"] = _sr_pairs
-            st.session_state["sr_ver"]   = _sr_ver
 
         _sr_pairs = st.session_state.get("sr_pairs")
         if _sr_pairs is not None:
@@ -1251,11 +1251,12 @@ with tab_smart:
                 for p in _sr_pairs:
                     _bd = p["breakdown"]
                     with st.expander(f"{p['verdict']}  — `{p['ep1_key']}` vs `{p['ep2_key']}`"):
-                        _c1, _c2, _c3, _c4 = st.columns(4)
-                        _c1.metric("Path", f"{_bd['path']}%")
-                        _c2.metric("Params", f"{_bd['params']}%")
+                        _c1, _c2, _c3, _c4, _c5 = st.columns(5)
+                        _c1.metric("Resp Schema ★", f"{_bd['resp_schema']}%")
+                        _c2.metric("Method ★", f"{_bd['method']}%")
                         _c3.metric("Req Schema", f"{_bd['req_schema']}%")
-                        _c4.metric("Resp Schema", f"{_bd['resp_schema']}%")
+                        _c4.metric("Path", f"{_bd['path']}%")
+                        _c5.metric("Params", f"{_bd['params']}%")
                         st.progress(int(p["score"]), text=f"Overall {p['score']}%")
 
                         # Side-by-side signal bars
