@@ -30,6 +30,7 @@ from config import SPECS_DIR, SAMPLES_DIR, SNAPSHOTS_DIR, BASE_URLS, REQUEST_TIM
 from curl_processor.excel_loader import load_excel, patch_bearer_token
 from curl_processor.curl_runner import fetch_token_from_curl, execute_api_curl
 from differ.merge_coverage import compute_merge_coverage, per_endpoint_coverage, coverage_color
+from differ.endpoint_cluster import find_merge_candidates, find_redundant_endpoints, score_pair
 
 # ─── Page Config ───
 st.set_page_config(
@@ -152,7 +153,7 @@ if len(specs) < 2:
     st.stop()
 
 # ─── TABS ───
-tab_overview, tab_spec_diff, tab_schema_detail, tab_samples, tab_live, tab_reconcile, tab_excel_curl, tab_merge = st.tabs([
+tab_overview, tab_spec_diff, tab_schema_detail, tab_samples, tab_live, tab_reconcile, tab_excel_curl, tab_merge, tab_smart = st.tabs([
     "📊 Overview",
     "📋 Spec Diff",
     "🔍 Schema Detail",
@@ -161,6 +162,7 @@ tab_overview, tab_spec_diff, tab_schema_detail, tab_samples, tab_live, tab_recon
     "🔗 Reconciliation",
     "📂 Excel CURL Runner",
     "🔀 Merge Coverage",
+    "🧠 Smart Analysis",
 ])
 
 
@@ -1050,15 +1052,24 @@ with tab_merge:
                                      if r.get("type_v1") and r.get("type_v2") and r["type_v1"] != r["type_v2"]]
                         if _missing:
                             st.error(f"❌ {len(_missing)} missing in v2")
-                            st.dataframe(pd.DataFrame(_missing)[[key_col] + (extra_cols or [])],
+                            _df_m = pd.DataFrame(_missing)
+                            _cols_m = [c for c in [key_col] + (extra_cols or []) if c in _df_m.columns]
+                            st.dataframe(_df_m[_cols_m] if _cols_m else _df_m,
                                          use_container_width=True, hide_index=True)
                         if _mismatch:
                             st.warning(f"⚠️ {len(_mismatch)} type-changed")
-                            st.dataframe(pd.DataFrame(_mismatch)[[key_col, "type_v1", "type_v2"]],
+                            _df_mm = pd.DataFrame(_mismatch)
+                            _mm_cols = [c for c in [key_col, "type_v1", "type_v2"] if c in _df_mm.columns]
+                            st.dataframe(_df_mm[_mm_cols] if _mm_cols else _df_mm,
                                          use_container_width=True, hide_index=True)
                         with st.expander(f"✅ {len(_covered)} covered"):
-                            st.dataframe(pd.DataFrame(_covered)[[key_col] + (extra_cols or [])],
-                                         use_container_width=True, hide_index=True)
+                            if _covered:
+                                _df_c = pd.DataFrame(_covered)
+                                _cols_c = [c for c in [key_col] + (extra_cols or []) if c in _df_c.columns]
+                                st.dataframe(_df_c[_cols_c] if _cols_c else _df_c,
+                                             use_container_width=True, hide_index=True)
+                            else:
+                                st.info("No covered items.")
 
                 _show_gap_table(_dt_params, result["parameters"]["rows"],    "parameter", ["in", "required_v1"])
                 _show_gap_table(_dt_req,    result["request_schema"]["rows"], "field",     ["type_v1", "required_v1"])
@@ -1094,6 +1105,164 @@ with tab_merge:
                 )
             else:
                 st.info("☝️ Click **Compute Coverage** to run the analysis.")
+
+
+# ═══ TAB 9: Smart Analysis ═══
+with tab_smart:
+    st.header("🧠 Smart Endpoint Analysis")
+    st.caption(
+        "Automatically detect which endpoints were **merged across versions** "
+        "and which endpoints within the **same version** are redundant — "
+        "without requiring manual selection."
+    )
+
+    smart_tab_merge, smart_tab_redundancy = st.tabs([
+        "🔀 Cross-Version: Merge Detection",
+        "♻️ Same-Version: Redundancy Detection",
+    ])
+
+    # ── Section 1: Cross-Version Merge Detection ──────────────────────────────
+    with smart_tab_merge:
+        st.subheader("Cross-Version Merge Detection")
+        st.markdown(
+            "Select two versions. The tool will **automatically score every (v1→v2) endpoint pair** "
+            "and group v1 endpoints that were likely merged into the same v2 endpoint."
+        )
+
+        _sv_col1, _sv_col2 = st.columns(2)
+        with _sv_col1:
+            _sm_src = st.selectbox("Source version (old)", sorted(specs.keys()), key="sm_src")
+        with _sv_col2:
+            _sm_tgt_opts = [v for v in sorted(specs.keys()) if v != _sm_src]
+            _sm_tgt = st.selectbox(
+                "Target version (new)",
+                _sm_tgt_opts if _sm_tgt_opts else sorted(specs.keys()),
+                key="sm_tgt",
+            )
+
+        _sm_threshold = st.slider(
+            "Minimum similarity threshold (%)",
+            min_value=10, max_value=90, value=40, step=5,
+            key="sm_threshold",
+            help="Lower = more candidates shown (more noise). Higher = only strong matches.",
+        )
+
+        _sm_run = st.button("🔍 Detect Merge Groups", type="primary", key="sm_run")
+
+        if _sm_run:
+            _sm_src_eps = extract_endpoints(specs[_sm_src])
+            _sm_tgt_eps = extract_endpoints(specs[_sm_tgt])
+            with st.spinner("Scoring endpoint pairs…"):
+                _sm_groups = find_merge_candidates(_sm_src_eps, _sm_tgt_eps, threshold=_sm_threshold)
+            st.session_state["sm_groups"]  = _sm_groups
+            st.session_state["sm_src_eps"] = _sm_src_eps
+            st.session_state["sm_tgt_eps"] = _sm_tgt_eps
+
+        _sm_groups = st.session_state.get("sm_groups")
+        if _sm_groups is not None:
+            st.markdown("---")
+            if not _sm_groups:
+                st.info(f"No merge groups found above {_sm_threshold}% similarity. Try lowering the threshold.")
+            else:
+                # Summary table
+                _summary_rows = [{
+                    "v2 Endpoint":        g["v2_key"],
+                    "# v1 Candidates":    len(g["candidates"]),
+                    "Avg Confidence":     f"{g['confidence']}%",
+                    "Top v1 Match":       g["candidates"][0]["v1_key"],
+                    "Top Score":          f"{g['candidates'][0]['score']}%",
+                    "Verdict":            g["verdict"],
+                } for g in _sm_groups]
+                st.success(f"Found **{len(_sm_groups)} merge group(s)**")
+                st.dataframe(pd.DataFrame(_summary_rows), use_container_width=True, hide_index=True)
+
+                st.markdown("### Detailed Breakdown")
+                for g in _sm_groups:
+                    _n = len(g["candidates"])
+                    _label = (
+                        f"🔀 **{g['v2_key']}** ← {_n} v1 endpoint(s) "
+                        f"(confidence {g['confidence']}%)"
+                    )
+                    with st.expander(_label):
+                        st.markdown(f"**Verdict:** {g['verdict']}")
+                        for c in g["candidates"]:
+                            _bd = c["breakdown"]
+                            st.markdown(
+                                f"**{c['v1_key']}** — Overall: `{c['score']}%`  \n"
+                                f"Path: `{_bd['path']}%` | "
+                                f"Params: `{_bd['params']}%` | "
+                                f"Req Schema: `{_bd['req_schema']}%` | "
+                                f"Resp Schema: `{_bd['resp_schema']}%`"
+                            )
+                            st.progress(int(c["score"]))
+                            st.divider()
+
+                        # Quick-fill button hint
+                        _v1_keys = [c["v1_key"] for c in g["candidates"]]
+                        st.info(
+                            f"💡 Go to **🔀 Merge Coverage** tab → select source version **{_sm_src}**, "
+                            f"target **{_sm_tgt}**, pick these v1 endpoints and **{g['v2_key']}** "
+                            "to run a full coverage analysis."
+                        )
+
+    # ── Section 2: Same-Version Redundancy Detection ──────────────────────────
+    with smart_tab_redundancy:
+        st.subheader("Same-Version Redundancy Detection")
+        st.markdown(
+            "Select a single version. The tool will find all endpoint **pairs** "
+            "with high structural similarity — strong candidates for consolidation."
+        )
+
+        _sr_ver = st.selectbox("Version to analyse", sorted(specs.keys()), key="sr_ver")
+        _sr_threshold = st.slider(
+            "Minimum similarity threshold (%)",
+            min_value=20, max_value=95, value=60, step=5,
+            key="sr_threshold",
+            help="Lower = more pairs (more noise). 60%+ is a good starting point.",
+        )
+
+        _sr_run = st.button("🔍 Find Redundant Endpoints", type="primary", key="sr_run")
+
+        if _sr_run:
+            _sr_eps = extract_endpoints(specs[_sr_ver])
+            _n_eps = len(_sr_eps)
+            with st.spinner(f"Scoring {_n_eps * (_n_eps - 1) // 2} endpoint pairs…"):
+                _sr_pairs = find_redundant_endpoints(_sr_eps, threshold=_sr_threshold)
+            st.session_state["sr_pairs"] = _sr_pairs
+            st.session_state["sr_ver"]   = _sr_ver
+
+        _sr_pairs = st.session_state.get("sr_pairs")
+        if _sr_pairs is not None:
+            st.markdown("---")
+            if not _sr_pairs:
+                st.info(f"No redundant pairs found above {_sr_threshold}%. All endpoints appear distinct.")
+            else:
+                # Summary
+                st.warning(f"Found **{len(_sr_pairs)} similar pair(s)** above {_sr_threshold}% threshold")
+                _sr_summary = [{
+                    "Endpoint 1":  p["ep1_key"],
+                    "Endpoint 2":  p["ep2_key"],
+                    "Similarity":  f"{p['score']}%",
+                    "Verdict":     p["verdict"],
+                } for p in _sr_pairs]
+                st.dataframe(pd.DataFrame(_sr_summary), use_container_width=True, hide_index=True)
+
+                st.markdown("### Detailed Breakdown")
+                for p in _sr_pairs:
+                    _bd = p["breakdown"]
+                    with st.expander(f"{p['verdict']}  — `{p['ep1_key']}` vs `{p['ep2_key']}`"):
+                        _c1, _c2, _c3, _c4 = st.columns(4)
+                        _c1.metric("Path", f"{_bd['path']}%")
+                        _c2.metric("Params", f"{_bd['params']}%")
+                        _c3.metric("Req Schema", f"{_bd['req_schema']}%")
+                        _c4.metric("Resp Schema", f"{_bd['resp_schema']}%")
+                        st.progress(int(p["score"]), text=f"Overall {p['score']}%")
+
+                        # Side-by-side signal bars
+                        st.markdown("**Signal breakdown:**")
+                        for sig, val in _bd.items():
+                            st.caption(sig.replace("_", " ").title())
+                            st.progress(int(val))
 
 
 # ─── Footer ───
